@@ -1,10 +1,7 @@
 """Screenshot utilities for capturing Android device screen."""
 
 import base64
-import os
 import subprocess
-import tempfile
-import uuid
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Tuple
@@ -22,7 +19,7 @@ class Screenshot:
     is_sensitive: bool = False
 
 
-def get_screenshot(device_id: str | None = None, timeout: int = 10) -> Screenshot:
+def get_screenshot(device_id: str | None = None, timeout: int = 60) -> Screenshot:
     """
     Capture a screenshot from the connected Android device.
 
@@ -37,48 +34,59 @@ def get_screenshot(device_id: str | None = None, timeout: int = 10) -> Screensho
         If the screenshot fails (e.g., on sensitive screens like payment pages),
         a black fallback image is returned with is_sensitive=True.
     """
-    temp_path = os.path.join(tempfile.gettempdir(), f"screenshot_{uuid.uuid4()}.png")
     adb_prefix = _get_adb_prefix(device_id)
 
     try:
-        # Execute screenshot command
-        result = subprocess.run(
-            adb_prefix + ["shell", "screencap", "-p", "/sdcard/tmp.png"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        # Use exec-out to avoid device disk I/O; retry once on failure/timeout.
+        last_error: Exception | None = None
+        for _ in range(2):
+            try:
+                result = subprocess.run(
+                    adb_prefix + ["exec-out", "screencap", "-p"],
+                    capture_output=True,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                last_error = e
+                continue
 
-        # Check for screenshot failure (sensitive screen)
-        output = result.stdout + result.stderr
-        if "Status: -1" in output or "Failed" in output:
-            return _create_fallback_screenshot(is_sensitive=True)
+            stdout_bytes = result.stdout or b""
+            stderr_text = ""
+            if result.stderr:
+                stderr_text = result.stderr.decode("utf-8", errors="ignore")
 
-        # Pull screenshot to local temp path
-        subprocess.run(
-            adb_prefix + ["pull", "/sdcard/tmp.png", temp_path],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
+            if not stdout_bytes:
+                if "Status: -1" in stderr_text or "Failed" in stderr_text:
+                    return _create_fallback_screenshot(is_sensitive=True)
+                last_error = RuntimeError("empty screenshot output")
+                continue
 
-        if not os.path.exists(temp_path):
-            return _create_fallback_screenshot(is_sensitive=False)
+            if not stdout_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+                combined_text = stderr_text
+                try:
+                    combined_text += stdout_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    pass
+                if "Status: -1" in combined_text or "Failed" in combined_text:
+                    return _create_fallback_screenshot(is_sensitive=True)
+                last_error = RuntimeError("screenshot output is not PNG")
+                continue
 
-        # Read and encode image
-        img = Image.open(temp_path)
-        width, height = img.size
+            img = Image.open(BytesIO(stdout_bytes))
+            width, height = img.size
+            base64_data = base64.b64encode(stdout_bytes).decode("utf-8")
 
-        buffered = BytesIO()
-        img.save(buffered, format="PNG")
-        base64_data = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            return Screenshot(
+                base64_data=base64_data,
+                width=width,
+                height=height,
+                is_sensitive=False,
+            )
 
-        # Cleanup
-        os.remove(temp_path)
-
-        return Screenshot(
-            base64_data=base64_data, width=width, height=height, is_sensitive=False
-        )
+        if last_error:
+            print(f"Screenshot warn: exec-out failed after retry: {last_error}")
+            raise last_error
+        return _create_fallback_screenshot(is_sensitive=False)
 
     except Exception as e:
         print(f"Screenshot error: {e}")
